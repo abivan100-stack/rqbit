@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 
 use arrayvec::ArrayVec;
-use atoi::{FromRadix10, FromRadix10Signed};
+use atoi::{FromRadix10Checked, FromRadix10SignedChecked};
 use buffers::ByteBuf;
 use clone_to_owned::CloneToOwned;
 use serde::{Deserialize, Serialize, forward_to_deserialize_any};
@@ -69,10 +69,15 @@ impl<'de> BencodeDeserializer<'de> {
         }
     }
 
-    fn parse_integer<I>(&mut self, atoi: impl Fn(&'de [u8]) -> (I, usize)) -> Result<I, Error> {
+    /// An integer, `i<digits>e`. One that doesn't fit `I` is an invalid value, never wrapped
+    /// around (nor, with overflow checks on, a panic).
+    fn parse_integer<I>(
+        &mut self,
+        atoi: impl Fn(&'de [u8]) -> (Option<I>, usize),
+    ) -> Result<I, Error> {
         self.parse_first_byte(b'i', Error::InvalidValue)?;
         match atoi(self.buf) {
-            (v, len) if len > 0 && self.buf.get(len) == Some(&b'e') => {
+            (Some(v), len) if len > 0 && self.buf.get(len) == Some(&b'e') => {
                 self.buf = &self.buf[len + 1..];
                 Ok(v)
             }
@@ -81,8 +86,9 @@ impl<'de> BencodeDeserializer<'de> {
     }
 
     fn parse_bytes(&mut self) -> Result<&'de [u8], Error> {
-        let b = match usize::from_radix_10(self.buf) {
-            (v, len) if len > 0 && self.buf.get(len) == Some(&b':') => {
+        // A length that doesn't fit a usize is an invalid value, as above.
+        let b = match usize::from_radix_10_checked(self.buf) {
+            (Some(v), len) if len > 0 && self.buf.get(len) == Some(&b':') => {
                 self.buf = unsafe { self.buf.get_unchecked(len + 1..) };
                 let (bytes, rest) = self.buf.split_at_checked(v).ok_or(Error::Eof)?;
                 self.buf = rest;
@@ -239,7 +245,7 @@ impl<'de> serde::de::Deserializer<'de> for &mut BencodeDeserializer<'de> {
     where
         V: serde::de::Visitor<'de>,
     {
-        let value = self.parse_integer::<u8>(u8::from_radix_10)?;
+        let value = self.parse_integer::<u8>(u8::from_radix_10_checked)?;
         if value > 1 {
             return Err(Error::InvalidBool(value));
         }
@@ -250,56 +256,56 @@ impl<'de> serde::de::Deserializer<'de> for &mut BencodeDeserializer<'de> {
     where
         V: serde::de::Visitor<'de>,
     {
-        visitor.visit_i8(self.parse_integer(i8::from_radix_10_signed)?)
+        visitor.visit_i8(self.parse_integer(i8::from_radix_10_signed_checked)?)
     }
 
     fn deserialize_i16<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: serde::de::Visitor<'de>,
     {
-        visitor.visit_i16(self.parse_integer(i16::from_radix_10_signed)?)
+        visitor.visit_i16(self.parse_integer(i16::from_radix_10_signed_checked)?)
     }
 
     fn deserialize_i32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: serde::de::Visitor<'de>,
     {
-        visitor.visit_i32(self.parse_integer(i32::from_radix_10_signed)?)
+        visitor.visit_i32(self.parse_integer(i32::from_radix_10_signed_checked)?)
     }
 
     fn deserialize_i64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: serde::de::Visitor<'de>,
     {
-        visitor.visit_i64(self.parse_integer(i64::from_radix_10_signed)?)
+        visitor.visit_i64(self.parse_integer(i64::from_radix_10_signed_checked)?)
     }
 
     fn deserialize_u8<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: serde::de::Visitor<'de>,
     {
-        visitor.visit_u8(self.parse_integer(u8::from_radix_10)?)
+        visitor.visit_u8(self.parse_integer(u8::from_radix_10_checked)?)
     }
 
     fn deserialize_u16<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: serde::de::Visitor<'de>,
     {
-        visitor.visit_u16(self.parse_integer(u16::from_radix_10)?)
+        visitor.visit_u16(self.parse_integer(u16::from_radix_10_checked)?)
     }
 
     fn deserialize_u32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: serde::de::Visitor<'de>,
     {
-        visitor.visit_u32(self.parse_integer(u32::from_radix_10)?)
+        visitor.visit_u32(self.parse_integer(u32::from_radix_10_checked)?)
     }
 
     fn deserialize_u64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: serde::de::Visitor<'de>,
     {
-        visitor.visit_u64(self.parse_integer(u64::from_radix_10)?)
+        visitor.visit_u64(self.parse_integer(u64::from_radix_10_checked)?)
     }
 
     fn deserialize_f32<V>(self, _visitor: V) -> Result<V::Value, Self::Error>
@@ -689,6 +695,29 @@ mod tests {
 
         let e = from_bytes::<Parent>(&b"d5:childd3:key2:hiee"[..]).expect_err("expected error");
         assert_eq!(format!("{e}"), "\"child\" -> \"key\": invalid value");
+    }
+
+    #[test]
+    fn numbers_too_big_are_invalid_not_wrapped() {
+        // A string's length past usize::MAX.
+        let long = b"d8:announce466666666666666666666666666666666666666666666666666660:xe";
+        assert!(from_bytes::<BencodeValue<ByteBuf>>(&long[..]).is_err());
+        assert!(from_bytes::<ByteBuf>(&b"18446744073709551619:x"[..]).is_err());
+        // Integers past their type.
+        assert!(from_bytes::<u64>(b"i18446744073709551616e").is_err());
+        assert!(from_bytes::<i64>(b"i9223372036854775808e").is_err());
+        assert!(from_bytes::<i64>(b"i-9223372036854775809e").is_err());
+        assert!(from_bytes::<u8>(b"i256e").is_err());
+        assert!(from_bytes::<bool>(b"i257e").is_err());
+        // Their largest still read.
+        assert_eq!(
+            from_bytes::<u64>(b"i18446744073709551615e").unwrap(),
+            u64::MAX
+        );
+        assert_eq!(
+            from_bytes::<i64>(b"i-9223372036854775808e").unwrap(),
+            i64::MIN
+        );
     }
 
     #[test]
