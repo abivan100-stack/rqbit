@@ -91,7 +91,7 @@ pub use create_torrent_file::{CreateTorrentOptions, CreateTorrentResult, create_
 pub use dht;
 pub use dht_utils::MetadataProgress;
 pub use librqbit_core::spawn_utils::spawn as librqbit_spawn;
-pub use listen::{ListenerMode, ListenerOptions};
+pub use listen::{ListenerMode, ListenerOptions, UtpBindError};
 pub use peer_connection::PeerConnectionOptions;
 pub use piece_order::PieceOrder;
 pub use session::{

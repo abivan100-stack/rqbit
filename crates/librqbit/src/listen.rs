@@ -21,6 +21,10 @@ pub(crate) struct ListenResult {
     pub max_pending_incoming_handshake_checks: usize,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("required uTP listener failed to bind: {0}")]
+pub struct UtpBindError(#[source] librqbit_utp::Error);
+
 #[derive(Debug, Clone, Copy)]
 pub enum ListenerMode {
     TcpOnly,
@@ -52,6 +56,8 @@ impl ListenerMode {
 pub struct ListenerOptions {
     pub mode: ListenerMode,
     pub listen_addr: SocketAddr,
+    /// Fail listener startup if uTP cannot bind, even when TCP is available.
+    pub fail_if_utp_bind_fails: bool,
     pub enable_upnp_port_forwarding: bool,
     pub utp_opts: Option<librqbit_utp::SocketOpts>,
     pub announce_port: Option<u16>,
@@ -65,6 +71,7 @@ impl Default for ListenerOptions {
             // TODO: once uTP is stable upgrade default to both
             mode: ListenerMode::TcpOnly,
             listen_addr: (Ipv6Addr::UNSPECIFIED, 0).into(),
+            fail_if_utp_bind_fails: false,
             enable_upnp_port_forwarding: false,
             utp_opts: None,
             announce_port: None,
@@ -134,6 +141,9 @@ impl ListenerOptions {
                     Some(sock)
                 }
                 Err(e) if tcp_socket.is_some() => {
+                    if self.fail_if_utp_bind_fails {
+                        return Err(UtpBindError(e).into());
+                    }
                     // If we listen over TCP, it's not a fatal error if we can't listen over uTP.
                     tracing::error!("Error listening on UDP {listen_addr:?}: {e:#}");
                     None
@@ -210,5 +220,57 @@ impl Accept for Arc<UtpSocketUdp> {
         let addr = stream.remote_addr();
         let (read, write) = stream.split();
         Ok((addr, (read, write)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn udp_held_with_tcp_available() -> (std::net::UdpSocket, SocketAddr) {
+        loop {
+            let held = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+            let addr = held.local_addr().unwrap();
+            if let Ok(tcp) = std::net::TcpListener::bind(addr) {
+                drop(tcp);
+                return (held, addr);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn listener_start_fails_when_utp_port_is_taken() {
+        let (_held, addr) = udp_held_with_tcp_available();
+        let options = ListenerOptions {
+            mode: ListenerMode::TcpAndUtp,
+            listen_addr: addr,
+            fail_if_utp_bind_fails: true,
+            ..ListenerOptions::default()
+        };
+
+        let result = options.start(None, CancellationToken::new(), None).await;
+
+        let Err(error) = result else {
+            panic!("uTP bind failure must be observable");
+        };
+        assert!(error.downcast_ref::<UtpBindError>().is_some());
+    }
+
+    #[tokio::test]
+    async fn listener_start_keeps_tcp_only_fallback_by_default() {
+        let (_held, addr) = udp_held_with_tcp_available();
+        let options = ListenerOptions {
+            mode: ListenerMode::TcpAndUtp,
+            listen_addr: addr,
+            ..ListenerOptions::default()
+        };
+
+        let result = options
+            .start(None, CancellationToken::new(), None)
+            .await
+            .expect("legacy fallback remains available");
+
+        assert!(result.tcp_socket.is_some());
+        assert!(result.utp_socket.is_none());
     }
 }
